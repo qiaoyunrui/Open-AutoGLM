@@ -168,7 +168,7 @@ if __name__ == "__main__":
     print("=" * 50)
 
     # Run basic example
-    print(f"\n1. Basic Task Example")
+    print("\n1. Basic Task Example")
     print("-" * 30)
     example_basic_task(args.lang)
 

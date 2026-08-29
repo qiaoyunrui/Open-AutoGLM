@@ -1,7 +1,6 @@
 """iOS device connection management via idevice tools and WebDriverAgent."""
 
 import subprocess
-import time
 from dataclasses import dataclass
 from enum import Enum
 

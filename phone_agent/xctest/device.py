@@ -1,12 +1,10 @@
 """Device control utilities for iOS automation via WebDriverAgent."""
 
-import subprocess
 import time
-from typing import Optional
 
 from phone_agent.config.apps_ios import APP_PACKAGES_IOS as APP_PACKAGES
 
-SCALE_FACTOR = 3 # 3 for most modern iPhone 
+SCALE_FACTOR = 3 # 3 for most modern iPhone
 
 def _get_wda_session_url(wda_url: str, session_id: str | None, endpoint: str) -> str:
     """

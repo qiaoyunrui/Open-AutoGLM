@@ -1,8 +1,5 @@
 """Input utilities for HarmonyOS device text input."""
 
-import base64
-import subprocess
-from typing import Optional
 
 from phone_agent.hdc.connection import _run_hdc_command
 

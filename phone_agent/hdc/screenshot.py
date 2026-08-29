@@ -2,14 +2,13 @@
 
 import base64
 import os
-import subprocess
 import tempfile
 import uuid
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Tuple
 
 from PIL import Image
+
 from phone_agent.hdc.connection import _run_hdc_command
 
 

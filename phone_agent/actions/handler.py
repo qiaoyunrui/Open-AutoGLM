@@ -1,11 +1,11 @@
 """Action handler for processing AI model outputs."""
 
 import ast
-import re
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from phone_agent.config.timing import TIMING_CONFIG
 from phone_agent.device_factory import get_device_factory
@@ -265,7 +265,7 @@ class ActionHandler:
         # Handle HDC devices with HarmonyOS-specific keyEvent command
         if device_factory.device_type == DeviceType.HDC:
             hdc_prefix = ["hdc", "-t", self.device_id] if self.device_id else ["hdc"]
-            
+
             # Map common keycodes to HarmonyOS keyEvent codes
             # KEYCODE_ENTER (66) -> 2054 (HarmonyOS Enter key code)
             if keycode == "KEYCODE_ENTER" or keycode == "66":

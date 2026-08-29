@@ -18,10 +18,8 @@ import os
 import shutil
 import subprocess
 import sys
-from urllib.parse import urlparse
 
 from openai import OpenAI
-
 from phone_agent import PhoneAgent
 from phone_agent.agent import AgentConfig
 from phone_agent.agent_ios import IOSAgentConfig, IOSPhoneAgent
@@ -333,7 +331,7 @@ def check_model_api(base_url: str, model_name: str, api_key: str = "EMPTY") -> b
             "Name or service not known" in error_msg
             or "nodename nor servname" in error_msg
         ):
-            print(f"   Error: Cannot resolve hostname")
+            print("   Error: Cannot resolve hostname")
             print("   Solution:")
             print("     1. Check the URL is correct")
             print("     2. Verify DNS settings")
@@ -576,14 +574,14 @@ def handle_ios_device_commands(args) -> bool:
 
             status = conn.get_wda_status()
             if status:
-                print(f"\nStatus details:")
+                print("\nStatus details:")
                 value = status.get("value", {})
                 print(f"  Session ID: {status.get('sessionId', 'N/A')}")
                 print(f"  Build: {value.get('build', {}).get('time', 'N/A')}")
 
                 current_app = value.get("currentApp", {})
                 if current_app:
-                    print(f"\nCurrent App:")
+                    print("\nCurrent App:")
                     print(f"  Bundle ID: {current_app.get('bundleId', 'N/A')}")
                     print(f"  Process ID: {current_app.get('pid', 'N/A')}")
         else:
@@ -592,7 +590,7 @@ def handle_ios_device_commands(args) -> bool:
             print("  1. Open WebDriverAgent.xcodeproj in Xcode")
             print("  2. Select your device")
             print("  3. Run WebDriverAgentRunner (Product > Test or Cmd+U)")
-            print(f"  4. For USB: Run port forwarding: iproxy 8100 8100")
+            print("  4. For USB: Run port forwarding: iproxy 8100 8100")
 
         return True
 
@@ -670,9 +668,9 @@ def handle_device_commands(args) -> bool:
             # Try to get device IP
             ip = conn.get_device_ip(args.device_id)
             if ip:
-                print(f"\nYou can now connect remotely using:")
+                print("\nYou can now connect remotely using:")
                 print(f"  python main.py --connect {ip}:{port}")
-                print(f"\nOr via ADB directly:")
+                print("\nOr via ADB directly:")
                 print(f"  adb connect {ip}:{port}")
             else:
                 print("\nCould not determine device IP. Check device WiFi settings.")

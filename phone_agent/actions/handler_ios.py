@@ -1,8 +1,9 @@
 """Action handler for iOS automation using WebDriverAgent."""
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from phone_agent.xctest import (
     back,

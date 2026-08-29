@@ -1,14 +1,12 @@
 """Device control utilities for HarmonyOS automation."""
 
-import os
-import subprocess
+import re
 import time
-from typing import List, Optional, Tuple
 
 from phone_agent.config.apps_harmonyos import APP_ABILITIES, APP_PACKAGES
 from phone_agent.config.timing import TIMING_CONFIG
 from phone_agent.hdc.connection import _run_hdc_command
-import re
+
 
 def get_current_app(device_id: str | None = None) -> str:
     """
@@ -73,7 +71,7 @@ def get_current_app(device_id: str | None = None) -> str:
         # If bundle is found but not in our known apps, return the bundle name
         print(f'Bundle is found but not in our known apps: {foreground_bundle}')
         return foreground_bundle
-    print(f'No bundle is found')
+    print('No bundle is found')
     return "System Home"
 
 
