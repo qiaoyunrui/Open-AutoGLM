@@ -1,15 +1,22 @@
 """Device control utilities for Android automation."""
 
+import glob
+import json
+import os
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 from phone_agent.config.apps import APP_PACKAGES
 from phone_agent.config.timing import TIMING_CONFIG
 
 _LAUNCHER_CACHE_TTL_SECONDS = 60.0
 _UI_DUMP_PATH = "/sdcard/autoglm_window_dump.xml"
+_AAPT_MAX_PACKAGES_PER_CALL = 25
 
 
 def _normalize_name(text: str) -> str:
@@ -23,6 +30,8 @@ _APP_PACKAGES_NORMALIZED: dict[str, str] = {
 
 _launcher_packages_cache: dict[str | None, tuple[float, frozenset[str]]] = {}
 _screen_size_cache: dict[str | None, tuple[float, tuple[int, int]]] = {}
+_label_cache: dict[str | None, dict[str, frozenset[str]]] = {}
+_label_scan_progress: dict[str | None, int] = {}
 
 
 def get_current_app(device_id: str | None = None) -> str:
@@ -284,6 +293,161 @@ def _get_screen_size(device_id: str | None = None) -> tuple[int, int] | None:
     return size
 
 
+def _find_aapt() -> str | None:
+    """Locate the Android SDK ``aapt`` binary on the host."""
+    aapt = os.environ.get("ANDROID_AAPT") or shutil.which("aapt")
+    if aapt:
+        return aapt
+    roots = [
+        os.environ.get("ANDROID_HOME") or "",
+        os.environ.get("ANDROID_SDK_ROOT") or "",
+        str(Path.home() / "Android" / "Sdk"),
+    ]
+    for root in roots:
+        if not root:
+            continue
+        for build_tools in sorted(
+            glob.glob(os.path.join(root, "build-tools", "*")), reverse=True
+        ):
+            candidate = os.path.join(build_tools, "aapt")
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+_LABEL_BADGING_RE = re.compile(
+    r"^application-label(?:-[^:]+)?:'([^']*)'", re.MULTILINE
+)
+
+
+def _parse_badging_labels(badging: str) -> frozenset[str]:
+    """Extract normalized display labels from ``aapt dump badging`` output."""
+    return frozenset(
+        normalized
+        for match in _LABEL_BADGING_RE.finditer(badging)
+        if (normalized := _normalize_name(match.group(1)))
+    )
+
+
+def _label_cache_path(device_id: str | None) -> Path:
+    """Path of the on-disk label->package cache for a device."""
+    base = os.environ.get("AUTOGLM_LABEL_CACHE_DIR") or tempfile.gettempdir()
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", device_id or "default")
+    return Path(base) / f"autoglm_launcher_labels_{safe}.json"
+
+
+def _load_label_cache(device_id: str | None) -> dict[str, frozenset[str]]:
+    """Return the in-process label cache, backfilling from disk on first use."""
+    cached = _label_cache.get(device_id)
+    if cached is not None:
+        return cached
+    path = _label_cache_path(device_id)
+    loaded: dict[str, frozenset[str]] = {}
+    try:
+        if path.is_file():
+            loaded = {
+                package: frozenset(labels)
+                for package, labels in json.loads(path.read_text(encoding="utf-8")).items()
+            }
+    except (OSError, ValueError):
+        loaded = {}
+    _label_cache[device_id] = loaded
+    return loaded
+
+
+def _save_label_cache(device_id: str | None, cache: dict[str, frozenset[str]]) -> None:
+    """Persist the in-process label cache to disk."""
+    try:
+        _label_cache_path(device_id).write_text(
+            json.dumps(
+                {package: list(labels) for package, labels in cache.items()},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _apk_path_for(package: str, adb_prefix: list) -> str | None:
+    """Return the on-device APK path for a package via ``pm path``."""
+    result = subprocess.run(
+        adb_prefix + ["shell", "pm", "path", package],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    match = re.search(r"package:(\S+)", result.stdout or "")
+    return match.group(1) if match else None
+
+
+def _dump_badging(apk_path: str, aapt: str) -> str:
+    result = subprocess.run(
+        [aapt, "dump", "badging", apk_path],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return result.stdout or ""
+
+
+def _scan_labels_for_name(app_name: str, device_id: str | None) -> bool:
+    """Learn display labels from installed APKs via host ``aapt`` (bounded batch).
+
+    Falls back to the on-disk cache first; scans only packages not yet cached.
+    Returns True when a package whose label matches the requested name is found.
+    """
+    aapt = _find_aapt()
+    if not aapt:
+        return False
+
+    normalized = _normalize_name(app_name)
+    cache = _load_label_cache(device_id)
+    if any(normalized in labels for labels in cache.values()):
+        return True
+
+    packages = sorted(_get_launcher_packages(device_id))
+    start = _label_scan_progress.get(device_id, 0)
+    adb_prefix = _get_adb_prefix(device_id)
+    processed = 0
+
+    for package in packages[start:]:
+        if processed >= _AAPT_MAX_PACKAGES_PER_CALL:
+            break
+        processed += 1
+        if package in cache:
+            continue
+
+        cache[package] = frozenset()
+        apk_path = _apk_path_for(package, adb_prefix)
+        if apk_path:
+            fd, tmp_path = tempfile.mkstemp(suffix=".apk", prefix="autoglm_label_")
+            try:
+                os.close(fd)
+                pull = subprocess.run(
+                    adb_prefix + ["pull", apk_path, tmp_path],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                )
+                if pull.returncode == 0 and os.path.getsize(tmp_path) > 0:
+                    labels = _parse_badging_labels(_dump_badging(tmp_path, aapt))
+                    if labels:
+                        cache[package] = labels
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+        if normalized in cache[package]:
+            break
+
+    _label_scan_progress[device_id] = start + processed
+    _save_label_cache(device_id, cache)
+    return any(normalized in labels for labels in cache.values())
+
+
 def _package_matches(requested_norm: str, package: str) -> bool:
     """Return True if a normalized name matches a package path token."""
     for part in re.split(r"[.\-_:]", package.lower()):
@@ -400,6 +564,12 @@ def _resolve_package(app_name: str, device_id: str | None = None) -> str | None:
     for package in launcher_packages:
         if _package_matches(normalized, package):
             return package
+
+    # Label-based resolution: learn display labels from installed APKs via aapt.
+    if _scan_labels_for_name(app_name, device_id):
+        for package, labels in _load_label_cache(device_id).items():
+            if normalized in labels:
+                return package
     return None
 
 
@@ -410,9 +580,9 @@ def launch_app(
     Launch an app by name.
 
     Resolution is layered: the static ``APP_PACKAGES`` mapping first, then a
-    fuzzy match against installed launchable packages on the device, and finally
-    a uiautomator scan of the launcher that taps the icon whose on-screen label
-    matches the requested name.
+    fuzzy match against installed launchable packages on the device, then a
+    ``aapt`` label scan of installed APKs, and finally a uiautomator scan of
+    the launcher that taps the icon whose on-screen label matches the name.
 
     Args:
         app_name: The app name or display label.
