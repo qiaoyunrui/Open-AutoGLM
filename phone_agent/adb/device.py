@@ -19,6 +19,7 @@ _LAUNCHER_CACHE_TTL_SECONDS = 60.0
 _UI_DUMP_PATH = "/sdcard/autoglm_window_dump.xml"
 _LABEL_SCAN_BUDGET_SECONDS = 60.0
 _LABEL_SCAN_WORKERS = 8
+_FOCUS_TIMEOUT_SECONDS = 15.0
 _SYSTEM_PACKAGE_PREFIXES = (
     "android.",
     "com.android.",
@@ -617,6 +618,37 @@ def _resolve_package(app_name: str, device_id: str | None = None) -> str | None:
     return None
 
 
+def _wait_for_package_focus(
+    package: str, device_id: str | None, timeout: float
+) -> bool:
+    """Wait until an app package owns the focused window.
+
+    Cold starts can take several seconds and pass through a focus-less
+    transition (``mCurrentFocus=null``); report success only once the target
+    actually holds the screen so callers never mistake pre-launch frames for
+    the launched app. Only ``mCurrentFocus`` counts: ``mFocusedApp`` lines are
+    unreliable here because stale ``AppWindowToken`` entries for the previous
+    activity linger in the dump until focus settles.
+    """
+    adb_prefix = _get_adb_prefix(device_id)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(
+                adb_prefix + ["shell", "dumpsys", "window"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+        except OSError:
+            return False
+        for line in result.stdout.split("\n"):
+            if "mCurrentFocus=" in line and package in line:
+                return True
+        time.sleep(0.5)
+    return False
+
+
 def launch_app(
     app_name: str, device_id: str | None = None, delay: float | None = None
 ) -> bool:
@@ -627,6 +659,8 @@ def launch_app(
     fuzzy match against installed launchable packages on the device, then a
     ``aapt`` label scan of installed APKs, and finally a uiautomator scan of
     the launcher that taps the icon whose on-screen label matches the name.
+    The resolved package must actually gain the foreground window within a
+    timeout, otherwise the launch is reported as failed.
 
     Args:
         app_name: The app name or display label.
@@ -634,7 +668,8 @@ def launch_app(
         delay: Delay in seconds after launching. If None, uses configured default.
 
     Returns:
-        True if app was launched, False if the app could not be found.
+        True if the app was launched and came to the foreground, False if it
+        could not be found or never gained the foreground window.
     """
     if delay is None:
         delay = TIMING_CONFIG.device.default_launch_delay
@@ -658,6 +693,11 @@ def launch_app(
         ],
         capture_output=True,
     )
+    focus_timeout = float(
+        os.environ.get("AUTOGLM_LAUNCH_FOCUS_TIMEOUT", _FOCUS_TIMEOUT_SECONDS)
+    )
+    if not _wait_for_package_focus(package, device_id, focus_timeout):
+        return False
     time.sleep(delay)
     return True
 
