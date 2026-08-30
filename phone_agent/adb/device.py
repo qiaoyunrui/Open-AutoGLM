@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from phone_agent.config.apps import APP_PACKAGES
@@ -16,7 +17,15 @@ from phone_agent.config.timing import TIMING_CONFIG
 
 _LAUNCHER_CACHE_TTL_SECONDS = 60.0
 _UI_DUMP_PATH = "/sdcard/autoglm_window_dump.xml"
-_AAPT_MAX_PACKAGES_PER_CALL = 25
+_LABEL_SCAN_BUDGET_SECONDS = 60.0
+_LABEL_SCAN_WORKERS = 8
+_SYSTEM_PACKAGE_PREFIXES = (
+    "android.",
+    "com.android.",
+    "com.google.android.",
+    "com.samsung.android.",
+    "com.sec.android.",
+)
 
 
 def _normalize_name(text: str) -> str:
@@ -31,7 +40,6 @@ _APP_PACKAGES_NORMALIZED: dict[str, str] = {
 _launcher_packages_cache: dict[str | None, tuple[float, frozenset[str]]] = {}
 _screen_size_cache: dict[str | None, tuple[float, tuple[int, int]]] = {}
 _label_cache: dict[str | None, dict[str, frozenset[str]]] = {}
-_label_scan_progress: dict[str | None, int] = {}
 
 
 def get_current_app(device_id: str | None = None) -> str:
@@ -391,11 +399,40 @@ def _dump_badging(apk_path: str, aapt: str) -> str:
     return result.stdout or ""
 
 
-def _scan_labels_for_name(app_name: str, device_id: str | None) -> bool:
-    """Learn display labels from installed APKs via host ``aapt`` (bounded batch).
+def _scan_package_labels(package: str, adb_prefix: list, aapt: str) -> frozenset[str]:
+    """Pull one APK and extract its normalized display labels (self-contained)."""
+    apk_path = _apk_path_for(package, adb_prefix)
+    if not apk_path:
+        return frozenset()
 
-    Falls back to the on-disk cache first; scans only packages not yet cached.
-    Returns True when a package whose label matches the requested name is found.
+    fd, tmp_path = tempfile.mkstemp(suffix=".apk", prefix="autoglm_label_")
+    try:
+        os.close(fd)
+        pull = subprocess.run(
+            adb_prefix + ["pull", apk_path, tmp_path],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        if pull.returncode == 0 and os.path.getsize(tmp_path) > 0:
+            return _parse_badging_labels(_dump_badging(tmp_path, aapt))
+    except OSError:
+        pass
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+    return frozenset()
+
+
+def _scan_labels_for_name(app_name: str, device_id: str | None) -> bool:
+    """Learn display labels from installed APKs via host ``aapt``.
+
+    Scans uncached packages in parallel within a wall-clock budget, prioritizing
+    user-installed apps and skipping packages already resolvable by the static
+    mapping. Results are persisted to disk so later calls pick up where the last
+    one left off. Returns True once a package label matches the requested name.
     """
     aapt = _find_aapt()
     if not aapt:
@@ -406,46 +443,53 @@ def _scan_labels_for_name(app_name: str, device_id: str | None) -> bool:
     if any(normalized in labels for labels in cache.values()):
         return True
 
-    packages = sorted(_get_launcher_packages(device_id))
-    start = _label_scan_progress.get(device_id, 0)
+    static_packages = frozenset(_APP_PACKAGES_NORMALIZED.values())
+    packages = sorted(
+        package
+        for package in _get_launcher_packages(device_id)
+        if package not in static_packages and package not in cache
+    )
+    # Third-party apps first (most common launch targets), system apps last.
+    packages.sort(
+        key=lambda package: (
+            package.startswith(_SYSTEM_PACKAGE_PREFIXES),
+            package,
+        )
+    )
+
+    budget = float(os.environ.get("AUTOGLM_LABEL_SCAN_BUDGET", _LABEL_SCAN_BUDGET_SECONDS))
+    workers = min(
+        int(os.environ.get("AUTOGLM_LABEL_SCAN_WORKERS", _LABEL_SCAN_WORKERS)),
+        max(len(packages), 1),
+    )
     adb_prefix = _get_adb_prefix(device_id)
-    processed = 0
+    deadline = time.monotonic() + budget
 
-    for package in packages[start:]:
-        if processed >= _AAPT_MAX_PACKAGES_PER_CALL:
-            break
-        processed += 1
-        if package in cache:
-            continue
-
-        cache[package] = frozenset()
-        apk_path = _apk_path_for(package, adb_prefix)
-        if apk_path:
-            fd, tmp_path = tempfile.mkstemp(suffix=".apk", prefix="autoglm_label_")
+    found = False
+    executor = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {
+            executor.submit(_scan_package_labels, package, adb_prefix, aapt): package
+            for package in packages
+        }
+        for future in as_completed(futures):
+            package = futures[future]
             try:
-                os.close(fd)
-                pull = subprocess.run(
-                    adb_prefix + ["pull", apk_path, tmp_path],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                )
-                if pull.returncode == 0 and os.path.getsize(tmp_path) > 0:
-                    labels = _parse_badging_labels(_dump_badging(tmp_path, aapt))
-                    if labels:
-                        cache[package] = labels
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
+                cache[package] = future.result()
+            except Exception:
+                cache[package] = frozenset()
+            if normalized in cache[package]:
+                found = True
+                break
+            if time.monotonic() >= deadline:
+                break
+    finally:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
 
-        if normalized in cache[package]:
-            break
-
-    _label_scan_progress[device_id] = start + processed
     _save_label_cache(device_id, cache)
-    return any(normalized in labels for labels in cache.values())
+    return found
 
 
 def _package_matches(requested_norm: str, package: str) -> bool:
